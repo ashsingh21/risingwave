@@ -14,19 +14,19 @@
 
 use std::fmt;
 
+use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::error::Result;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::SortNode;
 
-use super::{
-    ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, ToBatchProst, ToDistributedBatch,
-};
+use super::utils::{childless_record, Distill};
+use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch};
 use crate::optimizer::plan_node::ToLocalBatch;
 use crate::optimizer::property::{Order, OrderDisplay};
 
 /// `BatchSort` buffers all data from input and sort these rows by specified order, providing the
 /// collation required by user or parent plan node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BatchSort {
     pub base: PlanBase,
     input: PlanRef,
@@ -55,6 +55,16 @@ impl fmt::Display for BatchSort {
     }
 }
 
+impl Distill for BatchSort {
+    fn distill<'a>(&self) -> XmlNode<'a> {
+        let data = Pretty::display(&OrderDisplay {
+            order: self.order(),
+            input_schema: self.input.schema(),
+        });
+        childless_record("BatchSort", vec![("order", data)])
+    }
+}
+
 impl PlanTreeNodeUnary for BatchSort {
     fn input(&self) -> PlanRef {
         self.input.clone()
@@ -73,7 +83,7 @@ impl ToDistributedBatch for BatchSort {
     }
 }
 
-impl ToBatchProst for BatchSort {
+impl ToBatchPb for BatchSort {
     fn to_batch_prost_body(&self) -> NodeBody {
         let column_orders = self.base.order.to_protobuf();
         NodeBody::Sort(SortNode { column_orders })

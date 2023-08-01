@@ -20,21 +20,21 @@ use std::sync::Arc;
 use futures_async_stream::for_await;
 use parking_lot::RwLock;
 use pgwire::pg_response::StatementType;
-use pgwire::pg_server::{BoxedError, Session, SessionId, SessionManager, UserAuthenticator};
+use pgwire::pg_server::{BoxedError, SessionId, SessionManager, UserAuthenticator};
 use pgwire::types::Row;
 use risingwave_common::catalog::{
     FunctionId, IndexId, TableId, DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, DEFAULT_SUPER_USER,
-    DEFAULT_SUPER_USER_ID, NON_RESERVED_USER_ID, PG_CATALOG_SCHEMA_NAME,
+    DEFAULT_SUPER_USER_ID, NON_RESERVED_USER_ID, PG_CATALOG_SCHEMA_NAME, RW_CATALOG_SCHEMA_NAME,
 };
 use risingwave_common::error::Result;
+use risingwave_common::system_param::reader::SystemParamsReader;
+use risingwave_common::util::column_index_mapping::ColIndexMapping;
 use risingwave_pb::backup_service::MetaSnapshotMetadata;
 use risingwave_pb::catalog::table::OptionalAssociatedSourceId;
 use risingwave_pb::catalog::{
-    Database as ProstDatabase, Function as ProstFunction, Index as ProstIndex,
-    Schema as ProstSchema, Sink as ProstSink, Source as ProstSource, Table as ProstTable,
-    View as ProstView,
+    PbDatabase, PbFunction, PbIndex, PbSchema, PbSink, PbSource, PbTable, PbView,
 };
-use risingwave_pb::ddl_service::DdlProgress;
+use risingwave_pb::ddl_service::{create_connection_request, DdlProgress};
 use risingwave_pb::hummock::HummockSnapshot;
 use risingwave_pb::meta::list_table_fragments_response::TableFragmentInfo;
 use risingwave_pb::meta::{CreatingJobInfo, SystemParams};
@@ -42,19 +42,18 @@ use risingwave_pb::stream_plan::StreamFragmentGraph;
 use risingwave_pb::user::update_user_request::UpdateField;
 use risingwave_pb::user::{GrantPrivilege, UserInfo};
 use risingwave_rpc_client::error::Result as RpcResult;
-use risingwave_rpc_client::SystemParamsReader;
 use tempfile::{Builder, NamedTempFile};
 
 use crate::catalog::catalog_service::CatalogWriter;
 use crate::catalog::root_catalog::Catalog;
-use crate::catalog::{DatabaseId, SchemaId};
+use crate::catalog::{ConnectionId, DatabaseId, SchemaId};
 use crate::handler::RwPgResponse;
 use crate::meta_client::FrontendMetaClient;
 use crate::session::{AuthContext, FrontendEnv, SessionImpl};
 use crate::user::user_manager::UserInfoManager;
 use crate::user::user_service::UserInfoWriter;
 use crate::user::UserId;
-use crate::{FrontendOpts, PgResponseStream};
+use crate::FrontendOpts;
 
 /// An embedded frontend without starting meta and without starting frontend as a tcp server.
 pub struct LocalFrontend {
@@ -62,7 +61,7 @@ pub struct LocalFrontend {
     env: FrontendEnv,
 }
 
-impl SessionManager<PgResponseStream> for LocalFrontend {
+impl SessionManager for LocalFrontend {
     type Session = SessionImpl;
 
     fn connect(
@@ -74,15 +73,15 @@ impl SessionManager<PgResponseStream> for LocalFrontend {
     }
 
     fn cancel_queries_in_session(&self, _session_id: SessionId) {
-        todo!()
+        unreachable!()
     }
 
     fn cancel_creating_jobs_in_session(&self, _session_id: SessionId) {
-        todo!()
+        unreachable!()
     }
 
     fn end_session(&self, _session: &Self::Session) {
-        todo!()
+        unreachable!()
     }
 }
 
@@ -128,7 +127,7 @@ impl LocalFrontend {
 
     pub async fn get_explain_output(&self, sql: impl Into<String>) -> String {
         let mut rsp = self.run_sql(sql).await.unwrap();
-        assert_eq!(rsp.get_stmt_type(), StatementType::EXPLAIN);
+        assert_eq!(rsp.stmt_type(), StatementType::EXPLAIN);
         let mut res = String::new();
         #[for_await]
         for row_set in rsp.values_stream() {
@@ -167,7 +166,7 @@ impl LocalFrontend {
 }
 
 pub async fn get_explain_output(mut rsp: RwPgResponse) -> String {
-    if rsp.get_stmt_type() != StatementType::EXPLAIN {
+    if rsp.stmt_type() != StatementType::EXPLAIN {
         panic!("RESPONSE INVALID: {rsp:?}");
     }
     let mut res = String::new();
@@ -194,7 +193,7 @@ pub struct MockCatalogWriter {
 impl CatalogWriter for MockCatalogWriter {
     async fn create_database(&self, db_name: &str, owner: UserId) -> Result<()> {
         let database_id = self.gen_id();
-        self.catalog.write().create_database(&ProstDatabase {
+        self.catalog.write().create_database(&PbDatabase {
             name: db_name.to_string(),
             id: database_id,
             owner,
@@ -202,6 +201,8 @@ impl CatalogWriter for MockCatalogWriter {
         self.create_schema(database_id, DEFAULT_SCHEMA_NAME, owner)
             .await?;
         self.create_schema(database_id, PG_CATALOG_SCHEMA_NAME, owner)
+            .await?;
+        self.create_schema(database_id, RW_CATALOG_SCHEMA_NAME, owner)
             .await?;
         Ok(())
     }
@@ -213,7 +214,7 @@ impl CatalogWriter for MockCatalogWriter {
         owner: UserId,
     ) -> Result<()> {
         let id = self.gen_id();
-        self.catalog.write().create_schema(&ProstSchema {
+        self.catalog.write().create_schema(&PbSchema {
             id,
             name: schema_name.to_string(),
             database_id: db_id,
@@ -225,7 +226,7 @@ impl CatalogWriter for MockCatalogWriter {
 
     async fn create_materialized_view(
         &self,
-        mut table: ProstTable,
+        mut table: PbTable,
         _graph: StreamFragmentGraph,
     ) -> Result<()> {
         table.id = self.gen_id();
@@ -234,7 +235,7 @@ impl CatalogWriter for MockCatalogWriter {
         Ok(())
     }
 
-    async fn create_view(&self, mut view: ProstView) -> Result<()> {
+    async fn create_view(&self, mut view: PbView) -> Result<()> {
         view.id = self.gen_id();
         self.catalog.write().create_view(&view);
         self.add_table_or_source_id(view.id, view.schema_id, view.database_id);
@@ -243,8 +244,8 @@ impl CatalogWriter for MockCatalogWriter {
 
     async fn create_table(
         &self,
-        source: Option<ProstSource>,
-        mut table: ProstTable,
+        source: Option<PbSource>,
+        mut table: PbTable,
         graph: StreamFragmentGraph,
     ) -> Result<()> {
         if let Some(source) = source {
@@ -256,23 +257,28 @@ impl CatalogWriter for MockCatalogWriter {
         Ok(())
     }
 
-    async fn replace_table(&self, table: ProstTable, _graph: StreamFragmentGraph) -> Result<()> {
+    async fn replace_table(
+        &self,
+        table: PbTable,
+        _graph: StreamFragmentGraph,
+        _mapping: ColIndexMapping,
+    ) -> Result<()> {
         self.catalog.write().update_table(&table);
         Ok(())
     }
 
-    async fn create_source(&self, source: ProstSource) -> Result<()> {
+    async fn create_source(&self, source: PbSource) -> Result<()> {
         self.create_source_inner(source).map(|_| ())
     }
 
-    async fn create_sink(&self, sink: ProstSink, graph: StreamFragmentGraph) -> Result<()> {
+    async fn create_sink(&self, sink: PbSink, graph: StreamFragmentGraph) -> Result<()> {
         self.create_sink_inner(sink, graph)
     }
 
     async fn create_index(
         &self,
-        mut index: ProstIndex,
-        mut index_table: ProstTable,
+        mut index: PbIndex,
+        mut index_table: PbTable,
         _graph: StreamFragmentGraph,
     ) -> Result<()> {
         index_table.id = self.gen_id();
@@ -289,8 +295,19 @@ impl CatalogWriter for MockCatalogWriter {
         Ok(())
     }
 
-    async fn create_function(&self, _function: ProstFunction) -> Result<()> {
-        todo!()
+    async fn create_function(&self, _function: PbFunction) -> Result<()> {
+        unreachable!()
+    }
+
+    async fn create_connection(
+        &self,
+        _connection_name: String,
+        _database_id: u32,
+        _schema_id: u32,
+        _owner_id: u32,
+        _connection: create_connection_request::Payload,
+    ) -> Result<()> {
+        unreachable!()
     }
 
     async fn drop_table(&self, source_id: Option<u32>, table_id: TableId) -> Result<()> {
@@ -317,7 +334,7 @@ impl CatalogWriter for MockCatalogWriter {
     }
 
     async fn drop_view(&self, _view_id: u32) -> Result<()> {
-        todo!()
+        unreachable!()
     }
 
     async fn drop_materialized_view(&self, table_id: TableId) -> Result<()> {
@@ -379,7 +396,11 @@ impl CatalogWriter for MockCatalogWriter {
     }
 
     async fn drop_function(&self, _function_id: FunctionId) -> Result<()> {
-        todo!()
+        unreachable!()
+    }
+
+    async fn drop_connection(&self, _connection_id: ConnectionId) -> Result<()> {
+        unreachable!()
     }
 
     async fn drop_database(&self, database_id: u32) -> Result<()> {
@@ -392,33 +413,63 @@ impl CatalogWriter for MockCatalogWriter {
         self.catalog.write().drop_schema(database_id, schema_id);
         Ok(())
     }
+
+    async fn alter_table_name(&self, table_id: u32, table_name: &str) -> Result<()> {
+        self.catalog
+            .write()
+            .alter_table_name_by_id(&table_id.into(), table_name);
+        Ok(())
+    }
+
+    async fn alter_view_name(&self, _view_id: u32, _view_name: &str) -> Result<()> {
+        unreachable!()
+    }
+
+    async fn alter_index_name(&self, _index_id: u32, _index_name: &str) -> Result<()> {
+        unreachable!()
+    }
+
+    async fn alter_sink_name(&self, _sink_id: u32, _sink_name: &str) -> Result<()> {
+        unreachable!()
+    }
+
+    async fn alter_source_name(&self, _source_id: u32, _source_name: &str) -> Result<()> {
+        unreachable!()
+    }
 }
 
 impl MockCatalogWriter {
     pub fn new(catalog: Arc<RwLock<Catalog>>) -> Self {
-        catalog.write().create_database(&ProstDatabase {
+        catalog.write().create_database(&PbDatabase {
             id: 0,
             name: DEFAULT_DATABASE_NAME.to_string(),
             owner: DEFAULT_SUPER_USER_ID,
         });
-        catalog.write().create_schema(&ProstSchema {
+        catalog.write().create_schema(&PbSchema {
             id: 1,
             name: DEFAULT_SCHEMA_NAME.to_string(),
             database_id: 0,
             owner: DEFAULT_SUPER_USER_ID,
         });
-        catalog.write().create_schema(&ProstSchema {
+        catalog.write().create_schema(&PbSchema {
             id: 2,
             name: PG_CATALOG_SCHEMA_NAME.to_string(),
+            database_id: 0,
+            owner: DEFAULT_SUPER_USER_ID,
+        });
+        catalog.write().create_schema(&PbSchema {
+            id: 3,
+            name: RW_CATALOG_SCHEMA_NAME.to_string(),
             database_id: 0,
             owner: DEFAULT_SUPER_USER_ID,
         });
         let mut map: HashMap<u32, DatabaseId> = HashMap::new();
         map.insert(1_u32, 0_u32);
         map.insert(2_u32, 0_u32);
+        map.insert(3_u32, 0_u32);
         Self {
             catalog,
-            id: AtomicU32::new(2),
+            id: AtomicU32::new(3),
             table_id_to_schema_id: Default::default(),
             schema_id_to_database_id: RwLock::new(map),
         }
@@ -487,14 +538,14 @@ impl MockCatalogWriter {
             .unwrap()
     }
 
-    fn create_source_inner(&self, mut source: ProstSource) -> Result<u32> {
+    fn create_source_inner(&self, mut source: PbSource) -> Result<u32> {
         source.id = self.gen_id();
         self.catalog.write().create_source(&source);
         self.add_table_or_source_id(source.id, source.schema_id, source.database_id);
         Ok(source.id)
     }
 
-    fn create_sink_inner(&self, mut sink: ProstSink, _graph: StreamFragmentGraph) -> Result<()> {
+    fn create_sink_inner(&self, mut sink: PbSink, _graph: StreamFragmentGraph) -> Result<()> {
         sink.id = self.gen_id();
         self.catalog.write().create_sink(&sink);
         self.add_table_or_sink_id(sink.id, sink.schema_id, sink.database_id);

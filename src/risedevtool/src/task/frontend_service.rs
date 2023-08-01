@@ -21,7 +21,7 @@ use itertools::Itertools;
 
 use super::{ExecuteContext, Task};
 use crate::util::{get_program_args, get_program_env_cmd, get_program_name};
-use crate::FrontendConfig;
+use crate::{add_tempo_endpoint, FrontendConfig};
 
 pub struct FrontendService {
     config: FrontendConfig,
@@ -36,7 +36,11 @@ impl FrontendService {
         let prefix_bin = env::var("PREFIX_BIN")?;
 
         if let Ok(x) = env::var("ENABLE_ALL_IN_ONE") && x == "true" {
-            Ok(Command::new(Path::new(&prefix_bin).join("risingwave").join("frontend-node")))
+            Ok(Command::new(
+                Path::new(&prefix_bin)
+                    .join("risingwave")
+                    .join("frontend-node"),
+            ))
         } else {
             Ok(Command::new(Path::new(&prefix_bin).join("frontend")))
         }
@@ -75,6 +79,9 @@ impl FrontendService {
             );
         }
 
+        let provide_tempo = config.provide_tempo.as_ref().unwrap();
+        add_tempo_endpoint(provide_tempo, cmd)?;
+
         Ok(())
     }
 }
@@ -87,6 +94,8 @@ impl Task for FrontendService {
         let mut cmd = self.frontend()?;
 
         cmd.env("RUST_BACKTRACE", "1");
+        // FIXME: Otherwise, CI will throw log size too large error
+        // cmd.env("RW_QUERY_LOG_PATH", DEFAULT_QUERY_LOG_PATH);
 
         let prefix_config = env::var("PREFIX_CONFIG")?;
         cmd.arg("--config-path")

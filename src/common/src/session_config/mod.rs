@@ -17,22 +17,24 @@ mod search_path;
 mod transaction_isolation_level;
 mod visibility_mode;
 
+use std::num::NonZeroU64;
 use std::ops::Deref;
 
 use chrono_tz::Tz;
-use derivative::{self, Derivative};
+use educe::{self, Educe};
 use itertools::Itertools;
 pub use query_mode::QueryMode;
 pub use search_path::{SearchPath, USER_NAME_WILD_CARD};
+use tracing::info;
 
 use crate::error::{ErrorCode, RwError};
 use crate::session_config::transaction_isolation_level::IsolationLevel;
-use crate::session_config::visibility_mode::VisibilityMode;
+pub use crate::session_config::visibility_mode::VisibilityMode;
 use crate::util::epoch::Epoch;
 
 // This is a hack, &'static str is not allowed as a const generics argument.
 // TODO: refine this using the adt_const_params feature.
-const CONFIG_KEYS: [&str; 19] = [
+const CONFIG_KEYS: [&str; 25] = [
     "RW_IMPLICIT_FLUSH",
     "CREATE_COMPACTION_GROUP_FOR_MV",
     "QUERY_MODE",
@@ -52,6 +54,12 @@ const CONFIG_KEYS: [&str; 19] = [
     "RW_ENABLE_TWO_PHASE_AGG",
     "RW_FORCE_TWO_PHASE_AGG",
     "RW_ENABLE_SHARE_PLAN",
+    "INTERVALSTYLE",
+    "BATCH_PARALLELISM",
+    "RW_STREAMING_ENABLE_BUSHY_JOIN",
+    "RW_ENABLE_JOIN_ORDERING",
+    "SERVER_VERSION",
+    "SERVER_VERSION_NUM",
 ];
 
 // MUST HAVE 1v1 relationship to CONFIG_KEYS. e.g. CONFIG_KEYS[IMPLICIT_FLUSH] =
@@ -75,6 +83,12 @@ const STREAMING_ENABLE_DELTA_JOIN: usize = 15;
 const ENABLE_TWO_PHASE_AGG: usize = 16;
 const FORCE_TWO_PHASE_AGG: usize = 17;
 const RW_ENABLE_SHARE_PLAN: usize = 18;
+const INTERVAL_STYLE: usize = 19;
+const BATCH_PARALLELISM: usize = 20;
+const STREAMING_ENABLE_BUSHY_JOIN: usize = 21;
+const RW_ENABLE_JOIN_ORDERING: usize = 22;
+const SERVER_VERSION: usize = 23;
+const SERVER_VERSION_NUM: usize = 24;
 
 trait ConfigEntry: Default + for<'a> TryFrom<&'a [&'a str], Error = RwError> {
     fn entry_name() -> &'static str;
@@ -129,7 +143,7 @@ impl<const NAME: usize, const DEFAULT: bool> Deref for ConfigBool<NAME, DEFAULT>
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq, Eq)]
 struct ConfigString<const NAME: usize>(String);
 
 impl<const NAME: usize> Deref for ConfigString<NAME> {
@@ -271,12 +285,23 @@ type QueryEpoch = ConfigU64<QUERY_EPOCH, 0>;
 type Timezone = ConfigString<TIMEZONE>;
 type StreamingParallelism = ConfigU64<STREAMING_PARALLELISM, 0>;
 type StreamingEnableDeltaJoin = ConfigBool<STREAMING_ENABLE_DELTA_JOIN, false>;
+type StreamingEnableBushyJoin = ConfigBool<STREAMING_ENABLE_BUSHY_JOIN, true>;
 type EnableTwoPhaseAgg = ConfigBool<ENABLE_TWO_PHASE_AGG, true>;
 type ForceTwoPhaseAgg = ConfigBool<FORCE_TWO_PHASE_AGG, false>;
 type EnableSharePlan = ConfigBool<RW_ENABLE_SHARE_PLAN, true>;
+type IntervalStyle = ConfigString<INTERVAL_STYLE>;
+type BatchParallelism = ConfigU64<BATCH_PARALLELISM, 0>;
+type EnableJoinOrdering = ConfigBool<RW_ENABLE_JOIN_ORDERING, true>;
+type ServerVersion = ConfigString<SERVER_VERSION>;
+type ServerVersionNum = ConfigI32<SERVER_VERSION_NUM, 80_300>;
 
-#[derive(Derivative)]
-#[derivative(Default)]
+/// Report status or notice to caller.
+pub trait ConfigReporter {
+    fn report_status(&mut self, key: &str, new_val: String);
+}
+
+#[derive(Educe)]
+#[educe(Default)]
 pub struct ConfigMap {
     /// If `RW_IMPLICIT_FLUSH` is on, then every INSERT/UPDATE/DELETE statement will block
     /// until the entire dataflow is refreshed. In other words, every related table & MV will
@@ -288,7 +313,8 @@ pub struct ConfigMap {
     create_compaction_group_for_mv: CreateCompactionGroupForMv,
 
     /// A temporary config variable to force query running in either local or distributed mode.
-    /// It will be removed in the future.
+    /// The default value is auto which means let the system decide to run batch queries in local
+    /// or distributed mode automatically.
     query_mode: QueryMode,
 
     /// see <https://www.postgresql.org/docs/current/runtime-config-client.html#:~:text=for%20more%20information.-,extra_float_digits,-(integer)>
@@ -323,15 +349,21 @@ pub struct ConfigMap {
     query_epoch: QueryEpoch,
 
     /// Session timezone. Defaults to UTC.
-    #[derivative(Default(value = "ConfigString::<TIMEZONE>(String::from(\"UTC\"))"))]
+    #[educe(Default(expression = "ConfigString::<TIMEZONE>(String::from(\"UTC\"))"))]
     timezone: Timezone,
 
     /// If `STREAMING_PARALLELISM` is non-zero, CREATE MATERIALIZED VIEW/TABLE/INDEX will use it as
     /// streaming parallelism.
     streaming_parallelism: StreamingParallelism,
 
-    /// Enable delta join in streaming query. Defaults to false.
+    /// Enable delta join for streaming queries. Defaults to false.
     streaming_enable_delta_join: StreamingEnableDeltaJoin,
+
+    /// Enable bushy join for streaming queries. Defaults to true.
+    streaming_enable_bushy_join: StreamingEnableBushyJoin,
+
+    /// Enable join ordering for streaming and batch queries. Defaults to true.
+    enable_join_ordering: EnableJoinOrdering,
 
     /// Enable two phase agg optimization. Defaults to true.
     /// Setting this to true will always set `FORCE_TWO_PHASE_AGG` to false.
@@ -346,10 +378,26 @@ pub struct ConfigMap {
     /// This means that DAG structured query plans can be constructed,
     /// rather than only tree structured query plans.
     enable_share_plan: EnableSharePlan,
+
+    /// see <https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-INTERVALSTYLE>
+    interval_style: IntervalStyle,
+
+    batch_parallelism: BatchParallelism,
+
+    /// The version of PostgreSQL that Risingwave claims to be.
+    #[educe(Default(expression = "ConfigString::<SERVER_VERSION>(String::from(\"8.3.0\"))"))]
+    server_version: ServerVersion,
+    server_version_num: ServerVersionNum,
 }
 
 impl ConfigMap {
-    pub fn set(&mut self, key: &str, val: Vec<String>) -> Result<(), RwError> {
+    pub fn set(
+        &mut self,
+        key: &str,
+        val: Vec<String>,
+        mut reporter: impl ConfigReporter,
+    ) -> Result<(), RwError> {
+        info!(%key, ?val, "set config");
         let val = val.iter().map(AsRef::as_ref).collect_vec();
         if key.eq_ignore_ascii_case(ImplicitFlush::entry_name()) {
             self.implicit_flush = val.as_slice().try_into()?;
@@ -360,7 +408,11 @@ impl ConfigMap {
         } else if key.eq_ignore_ascii_case(ExtraFloatDigit::entry_name()) {
             self.extra_float_digit = val.as_slice().try_into()?;
         } else if key.eq_ignore_ascii_case(ApplicationName::entry_name()) {
-            self.application_name = val.as_slice().try_into()?;
+            let new_application_name = val.as_slice().try_into()?;
+            if self.application_name != new_application_name {
+                self.application_name = new_application_name.clone();
+                reporter.report_status(ApplicationName::entry_name(), new_application_name.0);
+            }
         } else if key.eq_ignore_ascii_case(DateStyle::entry_name()) {
             self.date_style = val.as_slice().try_into()?;
         } else if key.eq_ignore_ascii_case(BatchEnableLookupJoin::entry_name()) {
@@ -387,6 +439,10 @@ impl ConfigMap {
             self.streaming_parallelism = val.as_slice().try_into()?;
         } else if key.eq_ignore_ascii_case(StreamingEnableDeltaJoin::entry_name()) {
             self.streaming_enable_delta_join = val.as_slice().try_into()?;
+        } else if key.eq_ignore_ascii_case(StreamingEnableBushyJoin::entry_name()) {
+            self.streaming_enable_bushy_join = val.as_slice().try_into()?;
+        } else if key.eq_ignore_ascii_case(EnableJoinOrdering::entry_name()) {
+            self.enable_join_ordering = val.as_slice().try_into()?;
         } else if key.eq_ignore_ascii_case(EnableTwoPhaseAgg::entry_name()) {
             self.enable_two_phase_agg = val.as_slice().try_into()?;
             if !*self.enable_two_phase_agg {
@@ -399,6 +455,10 @@ impl ConfigMap {
             }
         } else if key.eq_ignore_ascii_case(EnableSharePlan::entry_name()) {
             self.enable_share_plan = val.as_slice().try_into()?;
+        } else if key.eq_ignore_ascii_case(IntervalStyle::entry_name()) {
+            self.interval_style = val.as_slice().try_into()?;
+        } else if key.eq_ignore_ascii_case(BatchParallelism::entry_name()) {
+            self.batch_parallelism = val.as_slice().try_into()?;
         } else {
             return Err(ErrorCode::UnrecognizedConfigurationParameter(key.to_string()).into());
         }
@@ -434,17 +494,31 @@ impl ConfigMap {
         } else if key.eq_ignore_ascii_case(QueryEpoch::entry_name()) {
             Ok(self.query_epoch.to_string())
         } else if key.eq_ignore_ascii_case(Timezone::entry_name()) {
-            Ok(self.timezone.clone())
+            Ok(self.timezone.to_string())
         } else if key.eq_ignore_ascii_case(StreamingParallelism::entry_name()) {
             Ok(self.streaming_parallelism.to_string())
         } else if key.eq_ignore_ascii_case(StreamingEnableDeltaJoin::entry_name()) {
             Ok(self.streaming_enable_delta_join.to_string())
+        } else if key.eq_ignore_ascii_case(StreamingEnableBushyJoin::entry_name()) {
+            Ok(self.streaming_enable_bushy_join.to_string())
+        } else if key.eq_ignore_ascii_case(EnableJoinOrdering::entry_name()) {
+            Ok(self.enable_join_ordering.to_string())
         } else if key.eq_ignore_ascii_case(EnableTwoPhaseAgg::entry_name()) {
             Ok(self.enable_two_phase_agg.to_string())
         } else if key.eq_ignore_ascii_case(ForceTwoPhaseAgg::entry_name()) {
             Ok(self.force_two_phase_agg.to_string())
         } else if key.eq_ignore_ascii_case(EnableSharePlan::entry_name()) {
             Ok(self.enable_share_plan.to_string())
+        } else if key.eq_ignore_ascii_case(IntervalStyle::entry_name()) {
+            Ok(self.interval_style.to_string())
+        } else if key.eq_ignore_ascii_case(BatchParallelism::entry_name()) {
+            Ok(self.batch_parallelism.to_string())
+        } else if key.eq_ignore_ascii_case(ServerVersion::entry_name()) {
+            Ok(self.server_version.to_string())
+        } else if key.eq_ignore_ascii_case(ServerVersionNum::entry_name()) {
+            Ok(self.server_version_num.to_string())
+        } else if key.eq_ignore_ascii_case(ApplicationName::entry_name()) {
+            Ok(self.application_name.to_string())
         } else {
             Err(ErrorCode::UnrecognizedConfigurationParameter(key.to_string()).into())
         }
@@ -465,7 +539,7 @@ impl ConfigMap {
             VariableInfo{
                 name : QueryMode::entry_name().to_lowercase(),
                 setting : self.query_mode.to_string(),
-                description : String::from("A temporary config variable to force query running in either local or distributed mode.")
+                description : String::from("A temporary config variable to force query running in either local or distributed mode. If the value is auto, the system will decide for you automatically.")
             },
             VariableInfo{
                 name : ExtraFloatDigit::entry_name().to_lowercase(),
@@ -525,7 +599,17 @@ impl ConfigMap {
             VariableInfo{
                 name : StreamingEnableDeltaJoin::entry_name().to_lowercase(),
                 setting : self.streaming_enable_delta_join.to_string(),
-                description: String::from("Enable delta join in streaming query.")
+                description: String::from("Enable delta join in streaming queries.")
+            },
+            VariableInfo{
+                name : StreamingEnableBushyJoin::entry_name().to_lowercase(),
+                setting : self.streaming_enable_bushy_join.to_string(),
+                description: String::from("Enable bushy join in streaming queries.")
+            },
+            VariableInfo{
+                name : EnableJoinOrdering::entry_name().to_lowercase(),
+                setting : self.enable_join_ordering.to_string(),
+                description: String::from("Enable join ordering for streaming and batch queries.")
             },
             VariableInfo{
                 name : EnableTwoPhaseAgg::entry_name().to_lowercase(),
@@ -533,14 +617,34 @@ impl ConfigMap {
                 description: String::from("Enable two phase aggregation.")
             },
             VariableInfo{
-                name : EnableTwoPhaseAgg::entry_name().to_lowercase(),
-                setting : self.enable_two_phase_agg.to_string(),
+                name : ForceTwoPhaseAgg::entry_name().to_lowercase(),
+                setting : self.force_two_phase_agg.to_string(),
                 description: String::from("Force two phase aggregation.")
             },
             VariableInfo{
                 name : EnableSharePlan::entry_name().to_lowercase(),
                 setting : self.enable_share_plan.to_string(),
                 description: String::from("Enable sharing of common sub-plans. This means that DAG structured query plans can be constructed, rather than only tree structured query plans.")
+            },
+            VariableInfo{
+                name : IntervalStyle::entry_name().to_lowercase(),
+                setting : self.interval_style.to_string(),
+                description : String::from("It is typically set by an application upon connection to the server.")
+            },
+            VariableInfo{
+                name : BatchParallelism::entry_name().to_lowercase(),
+                setting : self.batch_parallelism.to_string(),
+                description: String::from("Sets the parallelism for batch. If 0, use default value.")
+            },
+            VariableInfo{
+                name : ServerVersion::entry_name().to_lowercase(),
+                setting : self.server_version.to_string(),
+                description : String::from("The version of the server.")
+            },
+            VariableInfo{
+                name : ServerVersionNum::entry_name().to_lowercase(),
+                setting : self.server_version_num.to_string(),
+                description : String::from("The version number of the server.")
             },
         ]
     }
@@ -589,8 +693,8 @@ impl ConfigMap {
         self.search_path.clone()
     }
 
-    pub fn only_checkpoint_visible(&self) -> bool {
-        matches!(self.visibility_mode, VisibilityMode::Checkpoint)
+    pub fn get_visible_mode(&self) -> VisibilityMode {
+        self.visibility_mode
     }
 
     pub fn get_query_epoch(&self) -> Option<Epoch> {
@@ -615,6 +719,14 @@ impl ConfigMap {
         *self.streaming_enable_delta_join
     }
 
+    pub fn get_streaming_enable_bushy_join(&self) -> bool {
+        *self.streaming_enable_bushy_join
+    }
+
+    pub fn get_enable_join_ordering(&self) -> bool {
+        *self.enable_join_ordering
+    }
+
     pub fn get_enable_two_phase_agg(&self) -> bool {
         *self.enable_two_phase_agg
     }
@@ -625,5 +737,16 @@ impl ConfigMap {
 
     pub fn get_enable_share_plan(&self) -> bool {
         *self.enable_share_plan
+    }
+
+    pub fn get_interval_style(&self) -> &str {
+        &self.interval_style
+    }
+
+    pub fn get_batch_parallelism(&self) -> Option<NonZeroU64> {
+        if self.batch_parallelism.0 != 0 {
+            return Some(NonZeroU64::new(self.batch_parallelism.0).unwrap());
+        }
+        None
     }
 }

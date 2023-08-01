@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::pin::pin;
+
+use anyhow::Context;
 use either::Either;
 use futures::stream::PollNext;
 use futures::StreamExt;
@@ -19,7 +22,7 @@ use futures_async_stream::try_stream;
 use risingwave_common::array::StreamChunk;
 use risingwave_common::catalog::ColumnDesc;
 use risingwave_common::types::DataType;
-use risingwave_common::util::sort_util::OrderPair;
+use risingwave_common::util::sort_util::ColumnOrder;
 use risingwave_storage::table::batch_table::storage_table::StorageTable;
 use risingwave_storage::StateStore;
 
@@ -61,7 +64,7 @@ pub(crate) struct ArrangeJoinSide<S: StateStore> {
 
     /// Order rules of the arrangement (only join key is needed, pk should not be included, used
     /// for lookup)
-    pub order_rules: Vec<OrderPair>,
+    pub order_rules: Vec<ColumnOrder>,
 
     /// Key indices for the join
     ///
@@ -98,7 +101,7 @@ pub async fn poll_until_barrier(stream: impl MessageStream, expected_barrier: Ba
     for item in stream {
         match item? {
             Message::Watermark(_) => {
-                todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
             }
             c @ Message::Chunk(_) => yield c,
             Message::Barrier(b) => {
@@ -121,8 +124,8 @@ fn prefer_right(_: &mut ()) -> PollNext {
 /// available for both left and right side, instead of being combined.
 #[try_stream(ok = BarrierAlignedMessage, error = StreamExecutorError)]
 pub async fn align_barrier(left: impl MessageStream, right: impl MessageStream) {
-    let mut left = Box::pin(left);
-    let mut right = Box::pin(right);
+    let mut left = pin!(left);
+    let mut right = pin!(right);
 
     enum SideStatus {
         LeftBarrier,
@@ -153,10 +156,10 @@ pub async fn align_barrier(left: impl MessageStream, right: impl MessageStream) 
                     break 'inner (SideStatus::RightBarrier, b);
                 }
                 Some(Either::Right(Ok(Message::Watermark(_)))) => {
-                    todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                    // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                 }
                 Some(Either::Left(Ok(Message::Watermark(_)))) => {
-                    todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                    // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                 }
                 Some(Either::Left(Err(e))) | Some(Either::Right(Err(e))) => return Err(e),
                 None => {
@@ -200,7 +203,7 @@ pub async fn stream_lookup_arrange_prev_epoch(
     stream: Box<dyn Executor>,
     arrangement: Box<dyn Executor>,
 ) {
-    let mut input = Box::pin(align_barrier(stream.execute(), arrangement.execute()));
+    let mut input = pin!(align_barrier(stream.execute(), arrangement.execute()));
     let mut arrange_buf = vec![];
     let mut stream_side_end = false;
 
@@ -235,10 +238,10 @@ pub async fn stream_lookup_arrange_prev_epoch(
                     }
                 }
                 Either::Left(Message::Watermark(_)) => {
-                    todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                    // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                 }
                 Either::Right(Message::Watermark(_)) => {
-                    todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                    // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                 }
             }
         }
@@ -247,10 +250,10 @@ pub async fn stream_lookup_arrange_prev_epoch(
             match input
                 .next()
                 .await
-                .expect("unexpected close of barrier aligner")?
+                .context("unexpected close of barrier aligner")??
             {
                 Either::Left(Message::Watermark(_)) => {
-                    todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                    // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                 }
                 Either::Left(Message::Chunk(msg)) => yield ArrangeMessage::Stream(msg),
                 Either::Left(Message::Barrier(b)) => {
@@ -284,7 +287,7 @@ pub async fn stream_lookup_arrange_this_epoch(
     stream: Box<dyn Executor>,
     arrangement: Box<dyn Executor>,
 ) {
-    let mut input = Box::pin(align_barrier(stream.execute(), arrangement.execute()));
+    let mut input = pin!(align_barrier(stream.execute(), arrangement.execute()));
     let mut stream_buf = vec![];
     let mut arrange_buf = vec![];
 
@@ -298,7 +301,7 @@ pub async fn stream_lookup_arrange_this_epoch(
             match input
                 .next()
                 .await
-                .expect("unexpected close of barrier aligner")?
+                .context("unexpected close of barrier aligner")??
             {
                 Either::Left(Message::Chunk(msg)) => {
                     // Should wait until arrangement from this epoch is available.
@@ -319,10 +322,10 @@ pub async fn stream_lookup_arrange_this_epoch(
                     break 'inner Status::ArrangeReady;
                 }
                 Either::Left(Message::Watermark(_)) => {
-                    todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                    // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                 }
                 Either::Right(Message::Watermark(_)) => {
-                    todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                    // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                 }
             }
         };
@@ -333,7 +336,7 @@ pub async fn stream_lookup_arrange_this_epoch(
                 match input
                     .next()
                     .await
-                    .expect("unexpected close of barrier aligner")?
+                    .context("unexpected close of barrier aligner")??
                 {
                     Either::Left(Message::Chunk(msg)) => yield ArrangeMessage::Stream(msg),
                     Either::Left(Message::Barrier(b)) => {
@@ -341,10 +344,10 @@ pub async fn stream_lookup_arrange_this_epoch(
                         break;
                     }
                     Either::Left(Message::Watermark(_)) => {
-                        todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                        // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                     }
                     Either::Right(Message::Watermark(_)) => {
-                        todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                        // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                     }
                     Either::Right(_) => unreachable!(),
                 }
@@ -355,7 +358,7 @@ pub async fn stream_lookup_arrange_this_epoch(
                 match input
                     .next()
                     .await
-                    .expect("unexpected close of barrier aligner")?
+                    .context("unexpected close of barrier aligner")??
                 {
                     Either::Left(_) => unreachable!(),
                     Either::Right(Message::Chunk(chunk)) => {
@@ -373,7 +376,7 @@ pub async fn stream_lookup_arrange_this_epoch(
                         break;
                     }
                     Either::Right(Message::Watermark(_)) => {
-                        todo!("https://github.com/risingwavelabs/risingwave/issues/6042")
+                        // TODO: https://github.com/risingwavelabs/risingwave/issues/6042
                     }
                 }
             },

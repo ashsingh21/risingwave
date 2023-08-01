@@ -14,21 +14,22 @@
 
 use std::fmt;
 
+use pretty_xmlish::XmlNode;
 use risingwave_common::error::Result;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::values_node::ExprTuple;
 use risingwave_pb::batch_plan::ValuesNode;
 
-use super::generic::GenericPlanRef;
+use super::utils::{childless_record, Distill};
 use super::{
-    ExprRewritable, LogicalValues, PlanBase, PlanRef, PlanTreeNodeLeaf, ToBatchProst,
+    ExprRewritable, LogicalValues, PlanBase, PlanRef, PlanTreeNodeLeaf, ToBatchPb,
     ToDistributedBatch,
 };
 use crate::expr::{Expr, ExprImpl, ExprRewriter};
 use crate::optimizer::plan_node::ToLocalBatch;
 use crate::optimizer::property::{Distribution, Order};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BatchValues {
     pub base: PlanBase,
     logical: LogicalValues,
@@ -55,15 +56,7 @@ impl BatchValues {
     }
 
     fn row_to_protobuf(&self, row: &[ExprImpl]) -> ExprTuple {
-        let cells = row
-            .iter()
-            .map(|x| {
-                self.base
-                    .ctx()
-                    .expr_with_session_timezone(x.clone())
-                    .to_expr_proto()
-            })
-            .collect();
+        let cells = row.iter().map(|x| x.to_expr_proto()).collect();
         ExprTuple { cells }
     }
 }
@@ -75,6 +68,12 @@ impl fmt::Display for BatchValues {
             .finish()
     }
 }
+impl Distill for BatchValues {
+    fn distill<'a>(&self) -> XmlNode<'a> {
+        let data = self.logical.rows_pretty();
+        childless_record("BatchValues", vec![("rows", data)])
+    }
+}
 
 impl ToDistributedBatch for BatchValues {
     fn to_distributed(&self) -> Result<PlanRef> {
@@ -82,7 +81,7 @@ impl ToDistributedBatch for BatchValues {
     }
 }
 
-impl ToBatchProst for BatchValues {
+impl ToBatchPb for BatchValues {
     fn to_batch_prost_body(&self) -> NodeBody {
         NodeBody::Values(ValuesNode {
             tuples: self

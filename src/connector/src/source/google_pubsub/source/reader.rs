@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use anyhow::{anyhow, ensure, Context, Result};
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone, Utc};
@@ -28,10 +26,9 @@ use super::TaggedReceivedMessage;
 use crate::impl_common_split_reader_logic;
 use crate::parser::ParserConfig;
 use crate::source::google_pubsub::PubsubProperties;
-use crate::source::monitor::SourceMetrics;
 use crate::source::{
-    BoxSourceWithStateStream, Column, SourceInfo, SourceMessage, SplitId, SplitImpl, SplitMetaData,
-    SplitReader,
+    BoxSourceWithStateStream, Column, SourceContextRef, SourceMessage, SplitId, SplitImpl,
+    SplitMetaData, SplitReader,
 };
 
 const PUBSUB_MAX_FETCH_MESSAGES: usize = 1024;
@@ -44,8 +41,7 @@ pub struct PubsubSplitReader {
 
     split_id: SplitId,
     parser_config: ParserConfig,
-    metrics: Arc<SourceMetrics>,
-    source_info: SourceInfo,
+    source_ctx: SourceContextRef,
 }
 
 impl PubsubSplitReader {
@@ -54,7 +50,7 @@ impl PubsubSplitReader {
         loop {
             let pull_result = self
                 .subscription
-                .pull(PUBSUB_MAX_FETCH_MESSAGES as i32, None, None)
+                .pull(PUBSUB_MAX_FETCH_MESSAGES as i32, None)
                 .await;
 
             let raw_chunk = match pull_result {
@@ -104,8 +100,7 @@ impl PubsubSplitReader {
             yield chunk;
 
             // Stop if we've approached the stop_offset
-            if let Some(stop_offset) = self.stop_offset
-            && latest_offset >= stop_offset {
+            if let Some(stop_offset) = self.stop_offset && latest_offset >= stop_offset {
                 return Ok(());
             }
         }
@@ -120,8 +115,7 @@ impl SplitReader for PubsubSplitReader {
         properties: PubsubProperties,
         splits: Vec<SplitImpl>,
         parser_config: ParserConfig,
-        metrics: Arc<SourceMetrics>,
-        source_info: SourceInfo,
+        source_ctx: SourceContextRef,
         _columns: Option<Vec<Column>>,
     ) -> Result<Self> {
         ensure!(
@@ -138,7 +132,9 @@ impl SplitReader for PubsubSplitReader {
         // Set environment variables consumed by `google_cloud_pubsub`
         properties.initialize_env();
 
-        let client = Client::default().await.map_err(|e| anyhow!(e))?;
+        let client = Client::new(Default::default())
+            .await
+            .map_err(|e| anyhow!(e))?;
         let subscription = client.subscription(&properties.subscription);
 
         if let Some(ref offset) = split.start_offset {
@@ -149,7 +145,7 @@ impl SplitReader for PubsubSplitReader {
                 .map_err(|e| anyhow!("error parsing offset: {:?}", e))?;
 
             subscription
-                .seek(SeekTo::Timestamp(timestamp.into()), None, None)
+                .seek(SeekTo::Timestamp(timestamp.into()), None)
                 .await
                 .map_err(|e| anyhow!("error seeking to pubsub offset: {:?}", e))?;
         }
@@ -171,8 +167,7 @@ impl SplitReader for PubsubSplitReader {
             split_id: split.id(),
             stop_offset,
             parser_config,
-            metrics,
-            source_info,
+            source_ctx,
         })
     }
 

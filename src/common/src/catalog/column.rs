@@ -15,9 +15,8 @@
 use std::borrow::Cow;
 
 use itertools::Itertools;
-use risingwave_pb::plan_common::{
-    ColumnCatalog as ProstColumnCatalog, ColumnDesc as ProstColumnDesc,
-};
+use risingwave_pb::plan_common::column_desc::GeneratedOrDefaultColumn;
+use risingwave_pb::plan_common::{PbColumnCatalog, PbColumnDesc};
 
 use super::row_id_column_desc;
 use crate::catalog::{Field, ROW_ID_COLUMN_ID};
@@ -38,6 +37,11 @@ impl std::fmt::Debug for ColumnId {
 impl ColumnId {
     pub const fn new(column_id: i32) -> Self {
         Self(column_id)
+    }
+
+    /// Sometimes the id field is filled later, we use this value for better debugging.
+    pub const fn placeholder() -> Self {
+        Self(i32::MAX - 1)
     }
 }
 
@@ -64,6 +68,11 @@ impl From<i32> for ColumnId {
         Self::new(column_id)
     }
 }
+impl From<&i32> for ColumnId {
+    fn from(column_id: &i32) -> Self {
+        Self::new(*column_id)
+    }
+}
 
 impl From<ColumnId> for i32 {
     fn from(id: ColumnId) -> i32 {
@@ -83,13 +92,14 @@ impl std::fmt::Display for ColumnId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ColumnDesc {
     pub data_type: DataType,
     pub column_id: ColumnId,
     pub name: String,
     pub field_descs: Vec<ColumnDesc>,
     pub type_name: String,
+    pub generated_or_default_column: Option<GeneratedOrDefaultColumn>,
 }
 
 impl ColumnDesc {
@@ -100,12 +110,13 @@ impl ColumnDesc {
             name: String::new(),
             field_descs: vec![],
             type_name: String::new(),
+            generated_or_default_column: None,
         }
     }
 
     /// Convert to proto
-    pub fn to_protobuf(&self) -> ProstColumnDesc {
-        ProstColumnDesc {
+    pub fn to_protobuf(&self) -> PbColumnDesc {
+        PbColumnDesc {
             column_type: Some(self.data_type.to_protobuf()),
             column_id: self.column_id.get_id(),
             name: self.name.clone(),
@@ -116,6 +127,7 @@ impl ColumnDesc {
                 .map(|f| f.to_protobuf())
                 .collect_vec(),
             type_name: self.type_name.clone(),
+            generated_or_default_column: self.generated_or_default_column.clone(),
         }
     }
 
@@ -158,6 +170,7 @@ impl ColumnDesc {
             name: name.to_string(),
             field_descs: vec![],
             type_name: "".to_string(),
+            generated_or_default_column: None,
         }
     }
 
@@ -177,6 +190,7 @@ impl ColumnDesc {
             name: name.to_string(),
             field_descs: fields,
             type_name: type_name.to_string(),
+            generated_or_default_column: None,
         }
     }
 
@@ -191,16 +205,31 @@ impl ColumnDesc {
                 .map(Self::from_field_without_column_id)
                 .collect_vec(),
             type_name: field.type_name.clone(),
+            generated_or_default_column: None,
         }
     }
 
     pub fn from_field_without_column_id(field: &Field) -> Self {
         Self::from_field_with_column_id(field, 0)
     }
+
+    pub fn is_generated(&self) -> bool {
+        matches!(
+            self.generated_or_default_column,
+            Some(GeneratedOrDefaultColumn::GeneratedColumn(_))
+        )
+    }
+
+    pub fn is_default(&self) -> bool {
+        matches!(
+            self.generated_or_default_column,
+            Some(GeneratedOrDefaultColumn::DefaultColumn(_))
+        )
+    }
 }
 
-impl From<ProstColumnDesc> for ColumnDesc {
-    fn from(prost: ProstColumnDesc) -> Self {
+impl From<PbColumnDesc> for ColumnDesc {
+    fn from(prost: PbColumnDesc) -> Self {
         let field_descs: Vec<ColumnDesc> = prost
             .field_descs
             .into_iter()
@@ -212,17 +241,18 @@ impl From<ProstColumnDesc> for ColumnDesc {
             name: prost.name,
             type_name: prost.type_name,
             field_descs,
+            generated_or_default_column: prost.generated_or_default_column,
         }
     }
 }
 
-impl From<&ProstColumnDesc> for ColumnDesc {
-    fn from(prost: &ProstColumnDesc) -> Self {
+impl From<&PbColumnDesc> for ColumnDesc {
+    fn from(prost: &PbColumnDesc) -> Self {
         prost.clone().into()
     }
 }
 
-impl From<&ColumnDesc> for ProstColumnDesc {
+impl From<&ColumnDesc> for PbColumnDesc {
     fn from(c: &ColumnDesc) -> Self {
         Self {
             column_type: c.data_type.to_protobuf().into(),
@@ -230,11 +260,12 @@ impl From<&ColumnDesc> for ProstColumnDesc {
             name: c.name.clone(),
             field_descs: c.field_descs.iter().map(ColumnDesc::to_protobuf).collect(),
             type_name: c.type_name.clone(),
+            generated_or_default_column: c.generated_or_default_column.clone(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnCatalog {
     pub column_desc: ColumnDesc,
     pub is_hidden: bool,
@@ -244,6 +275,16 @@ impl ColumnCatalog {
     /// Get the column catalog's is hidden.
     pub fn is_hidden(&self) -> bool {
         self.is_hidden
+    }
+
+    /// If the column is a generated column
+    pub fn is_generated(&self) -> bool {
+        self.column_desc.is_generated()
+    }
+
+    /// If the column is a column with default expr
+    pub fn is_default(&self) -> bool {
+        self.column_desc.is_default()
     }
 
     /// Get a reference to the column desc's data type.
@@ -262,8 +303,8 @@ impl ColumnCatalog {
     }
 
     /// Convert column catalog to proto
-    pub fn to_protobuf(&self) -> ProstColumnCatalog {
-        ProstColumnCatalog {
+    pub fn to_protobuf(&self) -> PbColumnCatalog {
+        PbColumnCatalog {
             column_desc: Some(self.column_desc.to_protobuf()),
             is_hidden: self.is_hidden,
         }
@@ -278,8 +319,8 @@ impl ColumnCatalog {
     }
 }
 
-impl From<ProstColumnCatalog> for ColumnCatalog {
-    fn from(prost: ProstColumnCatalog) -> Self {
+impl From<PbColumnCatalog> for ColumnCatalog {
+    fn from(prost: PbColumnCatalog) -> Self {
         Self {
             column_desc: prost.column_desc.unwrap().into(),
             is_hidden: prost.is_hidden,
@@ -329,22 +370,22 @@ pub fn is_column_ids_dedup(columns: &[ColumnCatalog]) -> bool {
 
 #[cfg(test)]
 pub mod tests {
-    use risingwave_pb::plan_common::ColumnDesc as ProstColumnDesc;
+    use risingwave_pb::plan_common::PbColumnDesc;
 
     use crate::catalog::ColumnDesc;
     use crate::test_prelude::*;
     use crate::types::DataType;
 
-    pub fn build_prost_desc() -> ProstColumnDesc {
+    pub fn build_prost_desc() -> PbColumnDesc {
         let city = vec![
-            ProstColumnDesc::new_atomic(DataType::Varchar.to_protobuf(), "country.city.address", 2),
-            ProstColumnDesc::new_atomic(DataType::Varchar.to_protobuf(), "country.city.zipcode", 3),
+            PbColumnDesc::new_atomic(DataType::Varchar.to_protobuf(), "country.city.address", 2),
+            PbColumnDesc::new_atomic(DataType::Varchar.to_protobuf(), "country.city.zipcode", 3),
         ];
         let country = vec![
-            ProstColumnDesc::new_atomic(DataType::Varchar.to_protobuf(), "country.address", 1),
-            ProstColumnDesc::new_struct("country.city", 4, ".test.City", city),
+            PbColumnDesc::new_atomic(DataType::Varchar.to_protobuf(), "country.address", 1),
+            PbColumnDesc::new_struct("country.city", 4, ".test.City", city),
         ];
-        ProstColumnDesc::new_struct("country", 5, ".test.Country", country)
+        PbColumnDesc::new_struct("country", 5, ".test.Country", country)
     }
 
     pub fn build_desc() -> ColumnDesc {

@@ -14,11 +14,13 @@
 //
 use std::fmt;
 
+use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::Schema;
 use risingwave_common::error::{ErrorCode, Result, RwError};
 use risingwave_pb::plan_common::JoinType;
 
-use super::generic::{self, GenericPlanNode};
+use super::generic::{self, push_down_into_join, push_down_join_condition, GenericPlanNode};
+use super::utils::{childless_record, Distill};
 use super::{
     ColPrunable, LogicalJoin, LogicalProject, PlanBase, PlanRef, PlanTreeNodeBinary,
     PredicatePushdown, ToBatch, ToStream,
@@ -33,7 +35,7 @@ use crate::utils::{ColIndexMapping, Condition, ConditionDisplay};
 
 /// `LogicalApply` represents a correlated join, where the right side may refer to columns from the
 /// left side.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogicalApply {
     pub base: PlanBase,
     left: PlanRef,
@@ -46,31 +48,48 @@ pub struct LogicalApply {
     correlated_id: CorrelatedId,
     /// The indices of `CorrelatedInputRef`s in `right`.
     correlated_indices: Vec<usize>,
-    /// If the subquery produces more than one result we have to report an error.
+    /// Whether we require the subquery to produce at most one row. If `true`, we have to report an
+    /// error if the subquery produces more than one row.
     max_one_row: bool,
 }
 
+impl Distill for LogicalApply {
+    fn distill<'a>(&self) -> XmlNode<'a> {
+        let mut vec = Vec::with_capacity(if self.max_one_row { 4 } else { 3 });
+        vec.push(("type", Pretty::debug(&self.join_type)));
+
+        let concat_schema = self.concat_schema();
+        let cond = Pretty::debug(&ConditionDisplay {
+            condition: &self.on,
+            input_schema: &concat_schema,
+        });
+        vec.push(("on", cond));
+
+        vec.push(("correlated_id", Pretty::debug(&self.correlated_id)));
+        if self.max_one_row {
+            vec.push(("max_one_row", Pretty::debug(&true)));
+        }
+
+        childless_record("LogicalApply", vec)
+    }
+}
 impl fmt::Display for LogicalApply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut builder = f.debug_struct("LogicalApply");
 
         builder.field("type", &self.join_type);
 
-        let mut concat_schema = self.left().schema().fields.clone();
-        concat_schema.extend(self.right().schema().fields.clone());
-        let concat_schema = Schema::new(concat_schema);
-        builder.field(
-            "on",
-            &ConditionDisplay {
-                condition: &self.on,
-                input_schema: &concat_schema,
-            },
-        );
+        let concat_schema = self.concat_schema();
+        let condition_display = ConditionDisplay {
+            condition: &self.on,
+            input_schema: &concat_schema,
+        };
+        builder.field("on", &condition_display);
 
         builder.field("correlated_id", &self.correlated_id);
 
         if self.max_one_row {
-            builder.field("max_one_row", &self.max_one_row);
+            builder.field("max_one_row", &true);
         }
 
         builder.finish()
@@ -263,6 +282,12 @@ impl LogicalApply {
         };
         on.rewrite_expr(&mut rewriter)
     }
+
+    fn concat_schema(&self) -> Schema {
+        let mut concat_schema = self.left().schema().fields.clone();
+        concat_schema.extend(self.right().schema().fields.clone());
+        Schema::new(concat_schema)
+    }
 }
 
 impl PlanTreeNodeBinary for LogicalApply {
@@ -318,28 +343,12 @@ impl PredicatePushdown for LogicalApply {
         let right_col_num = self.right().schema().len();
         let join_type = self.join_type();
 
-        let (left_from_filter, right_from_filter, on) = LogicalJoin::push_down(
-            &mut predicate,
-            left_col_num,
-            right_col_num,
-            LogicalJoin::can_push_left_from_filter(join_type),
-            LogicalJoin::can_push_right_from_filter(join_type),
-            LogicalJoin::can_push_on_from_filter(join_type),
-        );
+        let (left_from_filter, right_from_filter, on) =
+            push_down_into_join(&mut predicate, left_col_num, right_col_num, join_type);
 
         let mut new_on = self.on.clone().and(on);
-        let (left_from_on, right_from_on, on) = LogicalJoin::push_down(
-            &mut new_on,
-            left_col_num,
-            right_col_num,
-            LogicalJoin::can_push_left_from_on(join_type),
-            LogicalJoin::can_push_right_from_on(join_type),
-            false,
-        );
-        assert!(
-            on.always_true(),
-            "On-clause should not be pushed to on-clause."
-        );
+        let (left_from_on, right_from_on) =
+            push_down_join_condition(&mut new_on, left_col_num, right_col_num, join_type);
 
         let left_predicate = left_from_filter.and(left_from_on);
         let right_predicate = right_from_filter.and(right_from_on);

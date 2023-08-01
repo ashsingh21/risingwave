@@ -17,14 +17,15 @@ use std::fmt;
 use std::fmt::Formatter;
 
 use fixedbitset::FixedBitSet;
-use itertools::Itertools;
+use pretty_xmlish::{Pretty, StrAssocArr};
 use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::util::iter_util::ZipEqFast;
 
 use super::{GenericPlanNode, GenericPlanRef};
 use crate::expr::{assert_input_ref, Expr, ExprDisplay, ExprImpl, ExprRewriter, InputRef};
 use crate::optimizer::optimizer_context::OptimizerContextRef;
-use crate::utils::ColIndexMapping;
+use crate::optimizer::property::FunctionalDependencySet;
+use crate::utils::{ColIndexMapping, ColIndexMappingRewriteExt};
 
 fn check_expr_type(expr: &ExprImpl) -> std::result::Result<(), &'static str> {
     if expr.has_subquery() {
@@ -43,7 +44,7 @@ fn check_expr_type(expr: &ExprImpl) -> std::result::Result<(), &'static str> {
 }
 
 /// [`Project`] computes a set of expressions from its input relation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(clippy::manual_non_exhaustive)]
 pub struct Project<PlanRef> {
     pub exprs: Vec<ExprImpl>,
@@ -109,6 +110,11 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Project<PlanRef> {
     fn ctx(&self) -> OptimizerContextRef {
         self.input.ctx()
     }
+
+    fn functional_dependency(&self) -> FunctionalDependencySet {
+        let i2o = self.i2o_col_mapping();
+        i2o.rewrite_functional_dependency_set(self.input.functional_dependency().clone())
+    }
 }
 
 impl<PlanRef: GenericPlanRef> Project<PlanRef> {
@@ -171,6 +177,35 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
         (self.exprs, self.input)
     }
 
+    pub fn fmt_fields_with_builder(&self, builder: &mut fmt::DebugStruct<'_, '_>, schema: &Schema) {
+        builder.field("exprs", &self.exprs_for_display(schema));
+    }
+
+    pub fn fields_pretty<'a>(&self, schema: &Schema) -> StrAssocArr<'a> {
+        let f = |t| Pretty::debug(&t);
+        let e = Pretty::Array(self.exprs_for_display(schema).iter().map(f).collect());
+        vec![("exprs", e)]
+    }
+
+    fn exprs_for_display<'a>(&'a self, schema: &Schema) -> Vec<AliasedExpr<'a>> {
+        self.exprs
+            .iter()
+            .zip_eq_fast(schema.fields().iter())
+            .map(|(expr, field)| AliasedExpr {
+                expr: ExprDisplay {
+                    expr,
+                    input_schema: self.input.schema(),
+                },
+                alias: {
+                    match expr {
+                        ExprImpl::InputRef(_) | ExprImpl::Literal(_) => None,
+                        _ => Some(field.name.clone()),
+                    }
+                },
+            })
+            .collect()
+    }
+
     pub fn fmt_with_name(
         &self,
         f: &mut fmt::Formatter<'_>,
@@ -178,26 +213,7 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
         schema: &Schema,
     ) -> fmt::Result {
         let mut builder = f.debug_struct(name);
-        builder.field(
-            "exprs",
-            &self
-                .exprs
-                .iter()
-                .zip_eq_fast(schema.fields().iter())
-                .map(|(expr, field)| AliasedExpr {
-                    expr: ExprDisplay {
-                        expr,
-                        input_schema: self.input.schema(),
-                    },
-                    alias: {
-                        match expr {
-                            ExprImpl::InputRef(_) | ExprImpl::Literal(_) => None,
-                            _ => Some(field.name.clone()),
-                        }
-                    },
-                })
-                .collect_vec(),
-        );
+        self.fmt_fields_with_builder(&mut builder, schema);
         builder.finish()
     }
 
@@ -206,9 +222,8 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
         let input_len = self.input.schema().len();
         let mut map = vec![None; exprs.len()];
         for (i, expr) in exprs.iter().enumerate() {
-            map[i] = match expr {
-                ExprImpl::InputRef(input) => Some(input.index()),
-                _ => None,
+            if let ExprImpl::InputRef(input) = expr {
+                map[i] = Some(input.index())
             }
         }
         ColIndexMapping::with_target_size(map, input_len)
@@ -217,7 +232,15 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
     /// get the Mapping of columnIndex from input column index to output column index,if a input
     /// column corresponds more than one out columns, mapping to any one
     pub fn i2o_col_mapping(&self) -> ColIndexMapping {
-        self.o2i_col_mapping().inverse()
+        let exprs = &self.exprs;
+        let input_len = self.input.schema().len();
+        let mut map = vec![None; input_len];
+        for (i, expr) in exprs.iter().enumerate() {
+            if let ExprImpl::InputRef(input) = expr {
+                map[input.index()] = Some(i)
+            }
+        }
+        ColIndexMapping::with_target_size(map, exprs.len())
     }
 
     pub fn is_all_inputref(&self) -> bool {
@@ -270,6 +293,10 @@ impl ProjectBuilder {
             self.exprs_index.insert(expr.clone(), index);
             Ok(index)
         }
+    }
+
+    pub fn get_expr(&self, index: usize) -> Option<&ExprImpl> {
+        self.exprs.get(index)
     }
 
     pub fn expr_index(&self, expr: &ExprImpl) -> Option<usize> {
